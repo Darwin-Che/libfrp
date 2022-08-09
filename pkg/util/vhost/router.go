@@ -2,19 +2,67 @@ package vhost
 
 import (
 	"errors"
+	"fmt"
+	"os"
 	"sort"
 	"strings"
 	"sync"
+	"time"
+
+	"github.com/go-redis/redis"
 )
 
 var (
 	ErrRouterConfigConflict = errors.New("router config conflict")
 )
 
+type RouterFilter struct {
+	FilterTable  map[string]bool
+	FilterClient *redis.Client
+}
+
+func NewRouterFilter() *RouterFilter {
+	client := redis.NewClient(&redis.Options{
+		Addr:     os.Getenv("RD_HOST") + ":6379",
+		Password: "",
+		DB:       0,
+	})
+
+	var err error
+	for {
+		_, err = client.Ping().Result()
+		if err != nil {
+			fmt.Printf("connectRedis : %s\n", err)
+			time.Sleep(1 * time.Second)
+			continue
+		}
+		break
+	}
+
+	return &RouterFilter{
+		FilterTable:  make(map[string]bool),
+		FilterClient: client,
+	}
+}
+
+func (rf *RouterFilter) Filter(host string) bool {
+	if rf.FilterClient == nil {
+		return true
+	}
+	hGet := rf.FilterClient.HGet("subdomain:"+host, "enabled")
+	if hGet.Val() == "T" {
+		fmt.Println("RouterFilter : ", host, " -> ", hGet.Val())
+		return true
+	}
+	fmt.Println("RouterFilter : ", host, " -> ", hGet.Val())
+	return false
+}
+
 type routerByHTTPUser map[string][]*Router
 
 type Routers struct {
 	indexByDomain map[string]routerByHTTPUser
+	RouterFilter  RouterFilter
 
 	mutex sync.RWMutex
 }
@@ -31,6 +79,7 @@ type Router struct {
 func NewRouters() *Routers {
 	return &Routers{
 		indexByDomain: make(map[string]routerByHTTPUser),
+		RouterFilter:  *NewRouterFilter(),
 	}
 }
 
@@ -91,16 +140,22 @@ func (r *Routers) Get(host, path, httpUser string) (vr *Router, exist bool) {
 	r.mutex.RLock()
 	defer r.mutex.RUnlock()
 
+	// fmt.Println("H( 1 ) ", r.indexByDomain, host)
 	routersByHTTPUser, found := r.indexByDomain[host]
 	if !found {
 		return
 	}
 
 	vrs, found := routersByHTTPUser[httpUser]
+	// fmt.Println("H( 2 ) ", vrs, found)
 	if !found {
 		return
 	}
+	if !r.RouterFilter.Filter(host) {
+		return
+	}
 
+	// can't support load balance, will to do
 	for _, vr = range vrs {
 		if strings.HasPrefix(path, vr.location) {
 			return vr, true
