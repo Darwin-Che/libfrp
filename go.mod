@@ -9,6 +9,7 @@ require (
 	github.com/fatedier/golib v0.1.1-0.20220321042308-c306138b83ac
 	github.com/fatedier/kcp-go v2.0.4-0.20190803094908-fe8645b0a904+incompatible
 	github.com/go-playground/validator/v10 v10.6.1
+	github.com/go-redis/redis v6.15.9+incompatible
 	github.com/google/uuid v1.2.0
 	github.com/gorilla/mux v1.8.0
 	github.com/gorilla/websocket v1.4.2

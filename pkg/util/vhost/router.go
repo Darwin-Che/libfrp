@@ -2,9 +2,14 @@ package vhost
 
 import (
 	"errors"
+	"fmt"
+	"os"
 	"sort"
 	"strings"
 	"sync"
+	"time"
+
+	"github.com/go-redis/redis"
 )
 
 var (
@@ -15,8 +20,12 @@ type routerByHTTPUser map[string][]*Router
 
 type Routers struct {
 	indexByDomain map[string]routerByHTTPUser
+	enabledDomain map[string]routerByHTTPUser // A subset of indexByDomain
 
 	mutex sync.RWMutex
+
+	client *redis.Client
+	pubsub *redis.PubSub
 }
 
 type Router struct {
@@ -28,10 +37,108 @@ type Router struct {
 	payload interface{}
 }
 
-func NewRouters() *Routers {
-	return &Routers{
-		indexByDomain: make(map[string]routerByHTTPUser),
+func (r *Routers) initClient() {
+	r.client = redis.NewClient(&redis.Options{
+		Addr:     os.Getenv("RD_HOST") + ":6379",
+		Password: "",
+		DB:       0,
+	})
+
+	var err error
+	for {
+		_, err = r.client.Ping().Result()
+		if err != nil {
+			fmt.Printf("connectRedis : %s\n", err)
+			time.Sleep(1 * time.Second)
+			continue
+		}
+		break
 	}
+
+	_, err = r.client.Do("CONFIG", "SET", "notify-keyspace-events", "Eh").Result()
+	if err != nil {
+		fmt.Printf("unable to set keyspace events %v", err.Error())
+		os.Exit(1)
+	}
+
+	r.pubsub = r.client.PSubscribe("__keyevent@0__:hset*")
+	fmt.Println("Finish Subscribe")
+}
+
+func (r *Routers) RedisListen() {
+	for { // infinite loop
+		fmt.Println("RedisListen Loop")
+		message, err := r.pubsub.ReceiveMessage()
+		if err != nil {
+			fmt.Printf("error message - %v", err.Error())
+			break
+		}
+		fmt.Printf("Keyspace event recieved %v  \n", message.String())
+		redisKey := message.Payload
+		colonIdx := strings.Index(redisKey, ":")
+		domain := redisKey[colonIdx+1:]
+		ret := r.recheck(domain)
+		fmt.Printf("Recheck domain %v -> %v \n", domain, ret)
+	}
+}
+
+func (r *Routers) filter(domain string) bool {
+	if r.client == nil {
+		return true
+	}
+	hGet := r.client.HGet("subdomain:"+domain, "enabled")
+	if hGet.Val() == "T" {
+		fmt.Println("RouterFilter : ", domain, " -> ", hGet.Val())
+		return true
+	}
+	fmt.Println("Filter : ", domain, " -> ", hGet.Val())
+	return false
+}
+
+func (r *Routers) Enable(domain string) bool {
+	r.mutex.Lock()
+	defer r.mutex.Unlock()
+
+	_, found := r.enabledDomain[domain]
+	if found {
+		return false
+	}
+
+	r.enabledDomain[domain] = r.indexByDomain[domain]
+	return true
+}
+
+func (r *Routers) Disable(domain string) bool {
+	r.mutex.Lock()
+	defer r.mutex.Unlock()
+
+	_, found := r.enabledDomain[domain]
+	if !found {
+		return false
+	}
+
+	delete(r.enabledDomain, domain)
+	return true
+}
+
+func (r *Routers) recheck(domain string) bool {
+	if r.filter(domain) {
+		r.Enable(domain)
+		return true
+	} else {
+		r.Disable(domain)
+		return false
+	}
+}
+
+func NewRouters() *Routers {
+	ret := &Routers{
+		indexByDomain: make(map[string]routerByHTTPUser),
+		enabledDomain: make(map[string]routerByHTTPUser),
+	}
+	ret.initClient()
+	go ret.RedisListen()
+	return ret
 }
 
 func (r *Routers) Add(domain, location, httpUser string, payload interface{}) error {
@@ -62,6 +169,11 @@ func (r *Routers) Add(domain, location, httpUser string, payload interface{}) er
 
 	routersByHTTPUser[httpUser] = vrs
 	r.indexByDomain[domain] = routersByHTTPUser
+
+	if r.filter(domain) {
+		r.enabledDomain[domain] = routersByHTTPUser
+	}
+
 	return nil
 }
 
@@ -84,23 +196,31 @@ func (r *Routers) Del(domain, location, httpUser string) {
 			newVrs = append(newVrs, vr)
 		}
 	}
-	routersByHTTPUser[httpUser] = newVrs
+	if len(newVrs) == 0 && len(routersByHTTPUser) == 1 {
+		delete(r.indexByDomain, domain)
+		delete(r.enabledDomain, domain)
+	} else {
+		routersByHTTPUser[httpUser] = newVrs
+	}
 }
 
 func (r *Routers) Get(host, path, httpUser string) (vr *Router, exist bool) {
 	r.mutex.RLock()
 	defer r.mutex.RUnlock()
 
-	routersByHTTPUser, found := r.indexByDomain[host]
+	// fmt.Println("H( 1 ) ", r.indexByDomain, host)
+	routersByHTTPUser, found := r.enabledDomain[host]
 	if !found {
 		return
 	}
 
 	vrs, found := routersByHTTPUser[httpUser]
+	// fmt.Println("H( 2 ) ", vrs, found)
 	if !found {
 		return
 	}
 
+	// can't support load balance, will to do
 	for _, vr = range vrs {
 		if strings.HasPrefix(path, vr.location) {
 			return vr, true
